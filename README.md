@@ -2,29 +2,57 @@
 
 为 pypiserver 私服批量下载或构建 Python wheel 文件的 GitHub Action，支持 **linux amd64** 和 **linux aarch64** 双架构。
 
+## 核心特性
+
+- **自动解析传递依赖**：使用 `pip-compile` 解析完整依赖树，确保所有传递依赖都被下载/构建
+- **智能下载策略**：优先从 PyPI 下载已有 wheel，仅对缺失的包从 sdist 构建
+- **双架构并行构建**：x86_64 和 aarch64 同时构建，支持原生 ARM runner 或 QEMU 模拟
+- **多 Python 版本支持**：一次运行可构建多个 Python 版本的 wheel
+
 ## 工作原理
 
 ```
 requirements.txt / 内联依赖列表
         │
         ▼
-┌─────────────────────┐
-│  步骤1: 下载已有 wheel  │  pip download --only-binary=:all: --platform ...
-│  (从 PyPI 直接下载)    │  主流包（numpy, cryptography 等）通常已有 wheel
-└─────────┬───────────┘
+┌─────────────────────────────┐
+│  步骤0: 解析依赖树            │  pip-compile 解析所有传递依赖
+│  (生成完整依赖列表)           │  Django → Django + asgiref + sqlparse + tzdata + ...
+└─────────┬───────────────────┘
+          │ 完整依赖列表
+          ▼
+┌─────────────────────────────┐
+│  步骤1: 下载已有 wheel        │  pip download --only-binary=:all: --platform ...
+│  (从 PyPI 直接下载)          │  主流包通常已有 wheel
+└─────────┬───────────────────┘
           │ 缺失 wheel 的包
           ▼
-┌─────────────────────┐
-│  步骤2: 构建缺失 wheel  │  pip wheel --no-binary=:all: ...
-│  (从 sdist 源码构建)    │  在目标平台原生环境或 QEMU 模拟中构建
-└─────────┬───────────┘
+┌─────────────────────────────┐
+│  步骤2: 构建缺失 wheel        │  pip wheel --no-binary=<pkg> ...
+│  (从 sdist 源码构建)         │  在目标平台环境或 QEMU 中构建
+└─────────┬───────────────────┘
           │
           ▼
-┌─────────────────────┐
-│  步骤3: 上传 artifact  │  按 x86_64 / aarch64 分目录存储
-│  (可下载或部署到私服)    │  附带构建报告和失败列表
-└─────────────────────┘
+┌─────────────────────────────┐
+│  步骤3: 上传 artifact        │  按 x86_64 / aarch64 分目录存储
+│  (可下载或部署到私服)         │  附带构建报告和失败列表
+└─────────────────────────────┘
 ```
+
+## 传递依赖处理
+
+**问题**：`requirements.txt` 声明的依赖通常还有传递依赖。例如：
+```
+Django>=4.2
+  └── asgiref>=3.7.0
+  └── sqlparse>=0.3.1
+  └── tzdata (Windows only)
+```
+
+**解决方案**：
+1. **步骤0** 使用 `pip-compile` 解析完整依赖树，生成包含所有传递依赖的锁定文件
+2. 对锁定文件中的每个依赖下载/构建 wheel
+3. 构建时使用 `--find-links` 指向已下载的 wheel，避免重复构建
 
 ## 快速开始
 
@@ -39,8 +67,6 @@ requirements.txt / 内联依赖列表
 Django>=4.2
 psycopg2-binary
 numpy
-cryptography
-uWSGI
 ```
 
 4. 等待构建完成，下载 Artifacts
@@ -60,7 +86,6 @@ jobs:
             Django>=4.2
             psycopg2-binary
             numpy
-            cryptography
           architecture: 'both'
           python-version: '3.11'
           build-mode: 'auto'
@@ -78,8 +103,6 @@ jobs:
 | `aarch64-strategy` | 否 | `native` | `native`(原生ARM runner)、`qemu`(QEMU模拟) |
 | `build-deps` | 否 | - | 额外系统构建依赖（apt 包，空格分隔） |
 | `extra-index-url` | 否 | - | 额外 PyPI 索引 URL（如清华镜像源） |
-| `output-dir` | 否 | `wheelhouse` | wheel 输出目录 |
-| `upload-artifact` | 否 | `true` | 是否上传为 GitHub Artifact |
 | `build-timeout` | 否 | `30` | 单包构建超时（分钟） |
 
 ## 常见 C 扩展包的构建依赖
@@ -109,7 +132,6 @@ jobs:
 
 - 速度慢 5-10 倍
 - 无需特殊 runner，任何仓库都可用
-- 使用 `docker/setup-qemu-action` + manylinux 容器
 
 ## manylinux 版本选择
 
@@ -123,12 +145,15 @@ jobs:
 ```
 wheelhouse/
 ├── x86_64/
+│   ├── Django-4.2.11-py3-none-any.whl
+│   ├── asgiref-3.8.1-py3-none-any.whl
+│   ├── sqlparse-0.5.0-py3-none-any.whl
 │   ├── numpy-2.4.4-cp311-cp311-manylinux2014_x86_64.whl
-│   ├── cryptography-46.0.7-cp311-abi3-manylinux2014_x86_64.whl
 │   └── ...
 └── aarch64/
-    ├── numpy-2.4.4-cp311-cp311-manylinux2014_aarch64.whl
-    ├── cryptography-46.0.7-cp311-abi3-manylinux2014_aarch64.whl
+    ├── Django-4.2.11-py3-none-any.whl    # 纯 Python 包与 x86_64 相同
+    ├── asgiref-3.8.1-py3-none-any.whl
+    ├── numpy-2.4.4-cp311-cp311-manylinux2014_aarch64.whl  # C 扩展包架构不同
     └── ...
 ```
 
@@ -147,7 +172,6 @@ find wheelhouse -name "*.whl" -exec curl -X POST \
   https://your-pypiserver/api/packages/ \;
 
 # 方式三：在 GitHub Actions 中直接上传
-# 在 workflow 中添加步骤：
 - name: 上传到 pypiserver
   run: |
     find ./all-wheels -name "*.whl" -exec curl -X POST \
@@ -163,7 +187,6 @@ find wheelhouse -name "*.whl" -exec curl -X POST \
 ```yaml
 requirements: |
   Django>=4.2,<5.0
-  psycopg2-binary
   djangorestframework
   celery
   redis
@@ -172,19 +195,19 @@ python-version: '3.11'
 build-mode: auto
 ```
 
-### 示例2：构建需要编译的包（含系统依赖）
+解析后将包含所有传递依赖：Django, asgiref, sqlparse, tzdata, djangorestframework, celery, kombu, billiard, vine, click, click-didyoumean, click-plugins, click-repl, python-dateutil, pytz, tzdata, redis 等。
+
+### 示例2：构建需要编译的包
 
 ```yaml
 requirements: |
   psycopg2
-  mysqlclient
   uWSGI
-  lxml
 architecture: aarch64
 python-version: '3.11'
 build-mode: auto
 aarch64-strategy: native
-build-deps: 'libpq-dev default-libmysqlclient-dev libxml2-dev libxslt1-dev'
+build-deps: 'libpq-dev'
 ```
 
 ### 示例3：多 Python 版本 + 使用国内镜像
@@ -194,7 +217,6 @@ requirements: |
   numpy
   pandas
   scikit-learn
-  matplotlib
 architecture: both
 python-version: '3.9,3.10,3.11'
 build-mode: download-only
@@ -203,8 +225,22 @@ extra-index-url: 'https://pypi.tuna.tsinghua.edu.cn/simple'
 
 ## 注意事项
 
-1. **纯 Python 包**（`py3-none-any` wheel）只需下载一次，两种架构通用
-2. **主流 C 扩展包**（numpy, cryptography, cffi, lxml, grpcio 等）PyPI 上通常已有 aarch64 wheel，无需构建
-3. **仅 sdist 的包**需要在目标平台原生环境中构建，构建速度取决于包的编译复杂度
-4. **QEMU 模式**速度较慢，建议仅用于少量包的构建，大量包请使用原生 ARM runner
-5. 构建失败的包会在汇总报告中列出，可根据提示添加 `build-deps` 或调整 `build-timeout`
+1. **传递依赖自动处理**：使用 `pip-compile` 解析完整依赖树，无需手动列出所有依赖
+2. **纯 Python 包自动复用**：`py3-none-any` wheel 只需下载一次，两种架构通用
+3. **主流 C 扩展包**（numpy, cryptography, cffi, lxml, grpcio 等）PyPI 上通常已有 aarch64 wheel，无需构建
+4. **仅 sdist 的包**需要在目标平台原生环境中构建，构建速度取决于包的编译复杂度
+5. **QEMU 模式**速度较慢，建议仅用于少量包的构建
+6. 构建失败的包会在汇总报告中列出，可根据提示添加 `build-deps` 或调整 `build-timeout`
+
+## 文件结构
+
+```
+py-offline-dependencies/
+├── action.yml                    # Composite Action 定义
+├── README.md                     # 本文档
+├── scripts/
+│   ├── download_wheels.sh        # 下载已有 wheel（含传递依赖解析）
+│   └── build_wheels.sh           # 构建缺失的 wheel
+└── .github/workflows/
+    └── build-wheels.yml          # 完整 workflow
+```

@@ -66,11 +66,13 @@ on:
 
 jobs:
   # ==========================================
-  # Job 1: x86_64 架构
+  # Job 0: 解析依赖树（生成完整依赖列表）
   # ==========================================
-  build-x86_64:
-    if: inputs.architecture == 'both' || inputs.architecture == 'x86_64'
+  resolve-dependencies:
     runs-on: ubuntu-latest
+    outputs:
+      resolved-file: ${{ steps.resolve.outputs.resolved_file }}
+      package-count: ${{ steps.resolve.outputs.package_count }}
     steps:
       - uses: actions/checkout@v4
 
@@ -84,6 +86,78 @@ jobs:
             echo "$REQ" > ./requirements-input.txt
             echo "req_file=./requirements-input.txt" >> "$GITHUB_OUTPUT"
           fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '${{ inputs.python-version }}'
+
+      - name: 安装依赖解析工具
+        run: pip install pip-tools
+
+      - name: 解析完整依赖树
+        id: resolve
+        run: |
+          REQ_FILE="${{ steps.prep.outputs.req_file }}"
+          RESOLVED_FILE="./requirements_resolved.txt"
+
+          INDEX_ARGS=""
+          if [[ -n "${{ inputs.extra-index-url }}" ]]; then
+            INDEX_ARGS="--extra-index-url ${{ inputs.extra-index-url }}"
+          fi
+
+          echo "=== 解析依赖树 ==="
+          echo "输入文件: $REQ_FILE"
+
+          # 使用 pip-compile 解析所有传递依赖
+          if pip-compile \
+            ${INDEX_ARGS} \
+            --output-file "$RESOLVED_FILE" \
+            --no-header \
+            --no-emit-index-url \
+            "$REQ_FILE" 2>&1; then
+            echo "✓ pip-compile 解析成功"
+          else
+            echo "pip-compile 失败，使用原始文件"
+            cp "$REQ_FILE" "$RESOLVED_FILE"
+          fi
+
+          # 统计依赖数量
+          PKG_COUNT=$(grep -v '^\s*#' "$RESOLVED_FILE" | grep -v '^\s*-' | grep -v '^\s*$' | wc -l)
+          echo "解析出 ${PKG_COUNT} 个依赖（含传递依赖）"
+
+          echo "resolved_file=$RESOLVED_FILE" >> "$GITHUB_OUTPUT"
+          echo "package_count=$PKG_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: 显示解析结果
+        run: |
+          echo "### 完整依赖列表 (${{ steps.resolve.outputs.package_count }} 个)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat "${{ steps.resolve.outputs.resolved_file }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传解析结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolved-requirements
+          path: ./requirements_resolved.txt
+          retention-days: 1
+
+  # ==========================================
+  # Job 1: x86_64 架构
+  # ==========================================
+  build-x86_64:
+    needs: resolve-dependencies
+    if: inputs.architecture == 'both' || inputs.architecture == 'x86_64'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载解析后的依赖列表
+        uses: actions/download-artifact@v4
+        with:
+          name: resolved-requirements
+          path: .
 
       - uses: actions/setup-python@v5
         with:
@@ -103,7 +177,7 @@ jobs:
         run: |
           chmod +x ./scripts/download_wheels.sh
           bash ./scripts/download_wheels.sh \
-            --requirements-file "${{ steps.prep.outputs.req_file }}" \
+            --requirements-file ./requirements_resolved.txt \
             --platform "${{ inputs.manylinux-version }}_x86_64" \
             --python-versions "${{ inputs.python-version }}" \
             --output-dir ./wheelhouse/x86_64 \
@@ -114,7 +188,7 @@ jobs:
         run: |
           chmod +x ./scripts/build_wheels.sh
           bash ./scripts/build_wheels.sh \
-            --requirements-file "${{ steps.prep.outputs.req_file }}" \
+            --requirements-file ./requirements_resolved.txt \
             --output-dir ./wheelhouse/x86_64 \
             --extra-index-url "${{ inputs.extra-index-url }}" \
             --build-mode "${{ inputs.build-mode }}" \
@@ -131,21 +205,17 @@ jobs:
   # Job 2: aarch64 架构
   # ==========================================
   build-aarch64:
+    needs: resolve-dependencies
     if: inputs.architecture == 'both' || inputs.architecture == 'aarch64'
     runs-on: ${{ inputs.aarch64-strategy == 'native' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: 准备 requirements 文件
-        id: prep
-        run: |
-          REQ="${{ inputs.requirements }}"
-          if [[ "$REQ" =~ ^\./ || "$REQ" =~ ^/ ]]; then
-            echo "req_file=$REQ" >> "$GITHUB_OUTPUT"
-          else
-            echo "$REQ" > ./requirements-input.txt
-            echo "req_file=./requirements-input.txt" >> "$GITHUB_OUTPUT"
-          fi
+      - name: 下载解析后的依赖列表
+        uses: actions/download-artifact@v4
+        with:
+          name: resolved-requirements
+          path: .
 
       - uses: actions/setup-python@v5
         with:
@@ -171,7 +241,7 @@ jobs:
         run: |
           chmod +x ./scripts/download_wheels.sh
           bash ./scripts/download_wheels.sh \
-            --requirements-file "${{ steps.prep.outputs.req_file }}" \
+            --requirements-file ./requirements_resolved.txt \
             --platform "${{ inputs.manylinux-version }}_aarch64" \
             --python-versions "${{ inputs.python-version }}" \
             --output-dir ./wheelhouse/aarch64 \
@@ -182,7 +252,7 @@ jobs:
         run: |
           chmod +x ./scripts/build_wheels.sh
           bash ./scripts/build_wheels.sh \
-            --requirements-file "${{ steps.prep.outputs.req_file }}" \
+            --requirements-file ./requirements_resolved.txt \
             --output-dir ./wheelhouse/aarch64 \
             --extra-index-url "${{ inputs.extra-index-url }}" \
             --build-mode "${{ inputs.build-mode }}" \
@@ -193,7 +263,7 @@ jobs:
         run: |
           chmod +x ./scripts/build_wheels.sh
           bash ./scripts/build_wheels.sh \
-            --requirements-file "${{ steps.prep.outputs.req_file }}" \
+            --requirements-file ./requirements_resolved.txt \
             --output-dir ./wheelhouse/aarch64 \
             --extra-index-url "${{ inputs.extra-index-url }}" \
             --build-mode "${{ inputs.build-mode }}" \
@@ -212,7 +282,7 @@ jobs:
   # ==========================================
   summary:
     if: always()
-    needs: [build-x86_64, build-aarch64]
+    needs: [resolve-dependencies, build-x86_64, build-aarch64]
     runs-on: ubuntu-latest
     steps:
       - name: 下载所有 wheel 文件
@@ -225,7 +295,8 @@ jobs:
         run: |
           echo "## Python Wheels 构建结果" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "构建参数: Python ${{ inputs.python-version }}, ${{ inputs.manylinux-version }}, 模式=${{ inputs.build-mode }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**输入依赖**: ${{ needs.resolve-dependencies.outputs.package-count }} 个（含传递依赖）" >> "$GITHUB_STEP_SUMMARY"
+          echo "**构建参数**: Python ${{ inputs.python-version }}, ${{ inputs.manylinux-version }}, 模式=${{ inputs.build-mode }}" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
           for ARCH in x86_64 aarch64; do
@@ -235,6 +306,7 @@ jobs:
               echo "### ${ARCH} 架构 — ${WHL_COUNT} 个 wheel" >> "$GITHUB_STEP_SUMMARY"
               echo "" >> "$GITHUB_STEP_SUMMARY"
 
+              # 按包名分组显示，避免重复 wheel
               find "$DIR" -name "*.whl" -printf "%f\n" | sort | while read -r f; do
                 echo "- \`${f}\`" >> "$GITHUB_STEP_SUMMARY"
               done

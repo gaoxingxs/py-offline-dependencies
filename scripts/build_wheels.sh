@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # build_wheels.sh - 从 sdist 构建 wheel 文件
 # 支持原生构建和 QEMU 模拟 aarch64 构建
+# 构建时 pip wheel 会自动解析并构建传递依赖
 set -euo pipefail
 
 # ========== 参数解析 ==========
@@ -44,13 +45,13 @@ fi
 # 判断包是否已有 wheel（在输出目录中）
 has_wheel() {
   local pkg_name="$1"
-  # 将包名转为 wheel 文件名格式（小写，下划线替换连字符）
   local normalized
   normalized=$(echo "$pkg_name" | tr '[:upper:]' '[:lower:]' | tr '-' '_')
   find "$OUTPUT_DIR" -name "${normalized}-*.whl" 2>/dev/null | head -1 | grep -q .
 }
 
 # 在 Docker 容器中构建 wheel（用于 QEMU aarch64 模拟）
+# 关键：使用 --find-links 指向已下载的 wheel，避免重复构建已有依赖
 build_in_docker() {
   local pkg_spec="$1"
   local timeout_sec=$((BUILD_TIMEOUT * 60))
@@ -58,7 +59,6 @@ build_in_docker() {
   echo "  [QEMU/Docker] 构建: $pkg_spec"
 
   # 使用 manylinux 容器构建，确保 glibc 兼容性
-  # manylinux2014_aarch64 对应 quay.io/pypa/manylinux2014_aarch64
   docker run --rm --platform linux/arm64 \
     -v "$(cd "$(dirname "$OUTPUT_DIR")" && pwd)/$(basename "$OUTPUT_DIR"):/output" \
     -v "$(pwd):/workspace" \
@@ -70,8 +70,11 @@ build_in_docker() {
       set -e
       pip install --upgrade pip setuptools wheel build 2>&1
       echo '构建: '\${PKG_SPEC}
+      # --find-links 指向已下载的 wheel，避免重复构建传递依赖
+      # --no-binary 仅对目标包生效，传递依赖优先使用已有 wheel
       timeout \${BUILD_TIMEOUT} pip wheel \
-        --no-binary=:all: \
+        --no-binary=\$(echo '\${PKG_SPEC}' | sed 's/[<>=!].*//' | sed 's/\[.*//') \
+        --find-links=/output \
         \${INDEX_URL_ARGS} \
         --wheel-dir=/output \
         \"\${PKG_SPEC}\" 2>&1 && echo '构建成功' || echo '构建失败'
@@ -79,14 +82,19 @@ build_in_docker() {
 }
 
 # 在当前环境中构建 wheel
+# 关键：--find-links 指向已下载的 wheel，避免重复构建已有依赖
 build_native() {
   local pkg_spec="$1"
   local timeout_sec=$((BUILD_TIMEOUT * 60))
+  # 提取包名，仅对该包使用 --no-binary，传递依赖优先使用已有 wheel
+  local pkg_name
+  pkg_name=$(echo "$pkg_spec" | sed 's/[<>=!].*//' | sed 's/\[.*//')
 
   echo "  [原生] 构建: $pkg_spec"
 
   timeout "${timeout_sec}" pip wheel \
-    --no-binary=:all: \
+    --no-binary="$pkg_name" \
+    --find-links="$OUTPUT_DIR" \
     ${INDEX_URL_ARGS} \
     --wheel-dir="$OUTPUT_DIR" \
     "$pkg_spec"
