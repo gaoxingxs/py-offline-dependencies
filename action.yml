@@ -1,0 +1,306 @@
+name: 'Build Python Wheels'
+description: '为 pypiserver 私服下载或构建 Python wheel 文件，支持 linux amd64 和 aarch64 平台'
+inputs:
+  # 依赖项列表，每行一个，可直接从 requirements.txt 复制
+  requirements:
+    description: |
+      依赖项列表，每行一个。格式与 requirements.txt 一致。
+      支持：包名、带版本约束（如 Django>=4.2）、带 extras（如 requests[security]）、
+      VCS 地址（如 git+https://...）、本地路径（如 ./my-package）。
+      也支持直接传入 requirements.txt 的文件路径（以 ./ 或 / 开头）。
+    required: true
+    default: ''
+
+  # 目标架构
+  architecture:
+    description: |
+      目标 CPU 架构：
+      - x86_64: Linux AMD64 (x86_64/amd64)
+      - aarch64: Linux ARM64 (aarch64/arm64)
+      - both: 同时构建两种架构
+    required: false
+    default: 'both'
+
+  # Python 版本
+  python-version:
+    description: |
+      目标 Python 版本，如 '3.9', '3.10', '3.11', '3.12', '3.13'。
+      支持多版本，用逗号分隔，如 '3.9,3.10,3.11'。
+    required: false
+    default: '3.11'
+
+  # manylinux 版本
+  manylinux-version:
+    description: |
+      manylinux 标准版本，影响 wheel 的 glibc 兼容性下限：
+      - manylinux2014: 兼容 glibc >= 2.17 (CentOS 7+, Ubuntu 16.04+)
+      - manylinux_2_17: 等同 manylinux2014，新版命名
+      - manylinux_2_28: 兼容 glibc >= 2.28 (Ubuntu 20.04+, Debian 11+)
+      较低版本兼容更多系统，但构建环境更旧。
+    required: false
+    default: 'manylinux2014'
+
+  # 构建模式
+  build-mode:
+    description: |
+      构建模式：
+      - download-only: 仅下载 PyPI 上已有的 wheel，跳过无 wheel 的包
+      - build-only: 仅构建 PyPI 上没有 wheel 的包（从 sdist 构建）
+      - auto: 先下载已有 wheel，再构建缺失的（推荐）
+    required: false
+    default: 'auto'
+
+  # aarch64 构建方式
+  aarch64-strategy:
+    description: |
+      aarch64 构建策略：
+      - native: 使用原生 ARM64 runner（ubuntu-24.04-arm），速度快
+      - qemu: 在 x86_64 runner 上通过 QEMU 模拟，速度慢但无需 ARM runner
+      - auto: 优先尝试原生 runner，失败则回退 QEMU
+    required: false
+    default: 'native'
+
+  # 额外构建依赖
+  build-deps:
+    description: |
+      构建 wheel 时需要额外安装的系统依赖（apt 包），用空格分隔。
+      例如：'libpq-dev libssl-dev libffi-dev libxml2-dev libxslt1-dev'
+      常见 C 扩展包的构建依赖：
+      - psycopg2: libpq-dev
+      - lxml: libxml2-dev libxslt1-dev
+      - cryptography: libssl-dev libffi-dev
+      - mysqlclient: default-libmysqlclient-dev
+    required: false
+    default: ''
+
+  # pip 额外索引 URL
+  extra-index-url:
+    description: |
+      额外的 PyPI 索引 URL，用于查找私有或镜像源中的包。
+      例如：'https://pypi.tuna.tsinghua.edu.cn/simple'
+    required: false
+    default: ''
+
+  # 输出目录
+  output-dir:
+    description: 'wheel 文件输出目录（相对于仓库根目录）'
+    required: false
+    default: 'wheelhouse'
+
+  # 是否上传 artifact
+  upload-artifact:
+    description: '是否将构建结果上传为 GitHub Artifact'
+    required: false
+    default: 'true'
+
+  # 构建超时（分钟）
+  build-timeout:
+    description: '单个包的构建超时时间（分钟），超时后跳过该包继续构建下一个'
+    required: false
+    default: '30'
+
+outputs:
+  wheels-x86_64:
+    description: 'x86_64 架构的 wheel 文件列表'
+    value: ${{ steps.collect-outputs.outputs.wheels-x86_64 }}
+  wheels-aarch64:
+    description: 'aarch64 架构的 wheel 文件列表'
+    value: ${{ steps.collect-outputs.outputs.wheels-aarch64 }}
+  failed-x86_64:
+    description: 'x86_64 架构构建失败的包列表'
+    value: ${{ steps.collect-outputs.outputs.failed-x86_64 }}
+  failed-aarch64:
+    description: 'aarch64 架构构建失败的包列表'
+    value: ${{ steps.collect-outputs.outputs.failed-aarch64 }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 解析输入参数
+      id: parse-inputs
+      shell: bash
+      run: |
+        # 判断 requirements 是文件路径还是内联内容
+        REQ="${{ inputs.requirements }}"
+        if [[ "$REQ" =~ ^\./ || "$REQ" =~ ^/ ]]; then
+          # 文件路径
+          echo "requirements_type=file" >> "$GITHUB_OUTPUT"
+          echo "requirements_file=$REQ" >> "$GITHUB_OUTPUT"
+        else
+          # 内联内容，写入临时文件
+          REQ_FILE="${{ github.workspace }}/.requirements-inline.txt"
+          echo "$REQ" > "$REQ_FILE"
+          echo "requirements_type=inline" >> "$GITHUB_OUTPUT"
+          echo "requirements_file=$REQ_FILE" >> "$GITHUB_OUTPUT"
+        fi
+
+        # 解析架构
+        ARCH="${{ inputs.architecture }}"
+        echo "build_x86_64=false" >> "$GITHUB_OUTPUT"
+        echo "build_aarch64=false" >> "$GITHUB_OUTPUT"
+        if [[ "$ARCH" == "x86_64" || "$ARCH" == "both" ]]; then
+          echo "build_x86_64=true" >> "$GITHUB_OUTPUT"
+        fi
+        if [[ "$ARCH" == "aarch64" || "$ARCH" == "both" ]]; then
+          echo "build_aarch64=true" >> "$GITHUB_OUTPUT"
+        fi
+
+        # 解析 Python 版本
+        PY_VERSIONS="${{ inputs.python-version }}"
+        # 将逗号分隔转为空格分隔
+        PY_VERSIONS_SPACED=$(echo "$PY_VERSIONS" | tr ',' ' ')
+        echo "python_versions=$PY_VERSIONS_SPACED" >> "$GITHUB_OUTPUT"
+
+        # manylinux 平台标签
+        ML_VERSION="${{ inputs.manylinux-version }}"
+        echo "platform_x86_64=${ML_VERSION}_x86_64" >> "$GITHUB_OUTPUT"
+        echo "platform_aarch64=${ML_VERSION}_aarch64" >> "$GITHUB_OUTPUT"
+
+        echo "=== 参数解析结果 ==="
+        echo "架构: $ARCH (x86_64=$(cat "$GITHUB_OUTPUT" | grep build_x86_64 | cut -d= -f2), aarch64=$(cat "$GITHUB_OUTPUT" | grep build_aarch64 | cut -d= -f2))"
+        echo "Python 版本: $PY_VERSIONS_SPACED"
+        echo "manylinux: $ML_VERSION"
+        echo "构建模式: ${{ inputs.build-mode }}"
+        echo "aarch64 策略: ${{ inputs.aarch64-strategy }}"
+
+    - name: 设置 Python 环境
+      uses: actions/setup-python@v5
+      with:
+        python-version: '${{ steps.parse-inputs.outputs.python_versions }}'
+
+    - name: 安装构建工具
+      shell: bash
+      run: |
+        pip install --upgrade pip setuptools wheel build auditwheel
+
+    - name: 安装系统构建依赖
+      if: inputs.build-deps != ''
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ${{ inputs.build-deps }}
+
+    - name: 下载 x86_64 wheel 文件
+      if: steps.parse-inputs.outputs.build_x86_64 == 'true'
+      shell: bash
+      run: |
+        chmod +x "${{ github.action_path }}/scripts/download_wheels.sh"
+        bash "${{ github.action_path }}/scripts/download_wheels.sh" \
+          --requirements-file "${{ steps.parse-inputs.outputs.requirements_file }}" \
+          --platform "${{ steps.parse-inputs.outputs.platform_x86_64 }}" \
+          --python-versions "${{ steps.parse-inputs.outputs.python_versions }}" \
+          --output-dir "${{ inputs.output-dir }}/x86_64" \
+          --extra-index-url "${{ inputs.extra-index-url }}" \
+          --build-mode "${{ inputs.build-mode }}"
+
+    - name: 下载 aarch64 wheel 文件
+      if: steps.parse-inputs.outputs.build_aarch64 == 'true'
+      shell: bash
+      run: |
+        chmod +x "${{ github.action_path }}/scripts/download_wheels.sh"
+        bash "${{ github.action_path }}/scripts/download_wheels.sh" \
+          --requirements-file "${{ steps.parse-inputs.outputs.requirements_file }}" \
+          --platform "${{ steps.parse-inputs.outputs.platform_aarch64 }}" \
+          --python-versions "${{ steps.parse-inputs.outputs.python_versions }}" \
+          --output-dir "${{ inputs.output-dir }}/aarch64" \
+          --extra-index-url "${{ inputs.extra-index-url }}" \
+          --build-mode "${{ inputs.build-mode }}"
+
+    - name: 构建 x86_64 缺失的 wheel
+      if: steps.parse-inputs.outputs.build_x86_64 == 'true' && (inputs.build-mode == 'build-only' || inputs.build-mode == 'auto')
+      shell: bash
+      run: |
+        chmod +x "${{ github.action_path }}/scripts/build_wheels.sh"
+        bash "${{ github.action_path }}/scripts/build_wheels.sh" \
+          --requirements-file "${{ steps.parse-inputs.outputs.requirements_file }}" \
+          --output-dir "${{ inputs.output-dir }}/x86_64" \
+          --extra-index-url "${{ inputs.extra-index-url }}" \
+          --build-mode "${{ inputs.build-mode }}" \
+          --build-timeout "${{ inputs.build-timeout }}"
+
+    - name: 设置 QEMU（aarch64 模拟构建）
+      if: |
+        steps.parse-inputs.outputs.build_aarch64 == 'true' &&
+        inputs.aarch64-strategy == 'qemu' &&
+        (inputs.build-mode == 'build-only' || inputs.build-mode == 'auto')
+      uses: docker/setup-qemu-action@v4
+      with:
+        platforms: arm64
+
+    - name: 构建 aarch64 缺失的 wheel（QEMU 模式）
+      if: |
+        steps.parse-inputs.outputs.build_aarch64 == 'true' &&
+        inputs.aarch64-strategy == 'qemu' &&
+        (inputs.build-mode == 'build-only' || inputs.build-mode == 'auto')
+      shell: bash
+      run: |
+        chmod +x "${{ github.action_path }}/scripts/build_wheels.sh"
+        bash "${{ github.action_path }}/scripts/build_wheels.sh" \
+          --requirements-file "${{ steps.parse-inputs.outputs.requirements_file }}" \
+          --output-dir "${{ inputs.output-dir }}/aarch64" \
+          --extra-index-url "${{ inputs.extra-index-url }}" \
+          --build-mode "${{ inputs.build-mode }}" \
+          --build-timeout "${{ inputs.build-timeout }}" \
+          --qemu
+
+    - name: 收集输出信息
+      id: collect-outputs
+      if: always()
+      shell: bash
+      run: |
+        # 收集 x86_64 wheel 列表
+        if [[ -d "${{ inputs.output-dir }}/x86_64" ]]; then
+          WHEELS_X86=$(find "${{ inputs.output-dir }}/x86_64" -name "*.whl" -printf "%f\n" | sort | tr '\n' '|')
+          echo "wheels-x86_64=${WHEELS_X86%|}" >> "$GITHUB_OUTPUT"
+        else
+          echo "wheels-x86_64=" >> "$GITHUB_OUTPUT"
+        fi
+
+        # 收集 aarch64 wheel 列表
+        if [[ -d "${{ inputs.output-dir }}/aarch64" ]]; then
+          WHEELS_ARM=$(find "${{ inputs.output-dir }}/aarch64" -name "*.whl" -printf "%f\n" | sort | tr '\n' '|')
+          echo "wheels-aarch64=${WHEELS_ARM%|}" >> "$GITHUB_OUTPUT"
+        else
+          echo "wheels-aarch64=" >> "$GITHUB_OUTPUT"
+        fi
+
+        # 收集失败列表
+        FAILED_X86=""
+        FAILED_ARM=""
+        if [[ -f "${{ inputs.output-dir }}/x86_64/.failed_packages.txt" ]]; then
+          FAILED_X86=$(cat "${{ inputs.output-dir }}/x86_64/.failed_packages.txt" | tr '\n' '|')
+        fi
+        if [[ -f "${{ inputs.output-dir }}/aarch64/.failed_packages.txt" ]]; then
+          FAILED_ARM=$(cat "${{ inputs.output-dir }}/aarch64/.failed_packages.txt" | tr '\n' '|')
+        fi
+        echo "failed-x86_64=${FAILED_X86%|}" >> "$GITHUB_OUTPUT"
+        echo "failed-aarch64=${FAILED_ARM%|}" >> "$GITHUB_OUTPUT"
+
+        # 输出汇总
+        echo ""
+        echo "========================================="
+        echo "  构建结果汇总"
+        echo "========================================="
+        if [[ -d "${{ inputs.output-dir }}/x86_64" ]]; then
+          X86_COUNT=$(find "${{ inputs.output-dir }}/x86_64" -name "*.whl" | wc -l)
+          echo "  x86_64:  ${X86_COUNT} 个 wheel 文件"
+          if [[ -n "$FAILED_X86" ]]; then
+            echo "  x86_64 失败: $(echo $FAILED_X86 | tr '|' ', ')"
+          fi
+        fi
+        if [[ -d "${{ inputs.output-dir }}/aarch64" ]]; then
+          ARM_COUNT=$(find "${{ inputs.output-dir }}/aarch64" -name "*.whl" | wc -l)
+          echo "  aarch64: ${ARM_COUNT} 个 wheel 文件"
+          if [[ -n "$FAILED_ARM" ]]; then
+            echo "  aarch64 失败: $(echo $FAILED_ARM | tr '|' ', ')"
+          fi
+        fi
+        echo "========================================="
+
+    - name: 上传 wheel 文件
+      if: inputs.upload-artifact == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: python-wheels-${{ github.run_number }}
+        path: ${{ inputs.output-dir }}/
+        retention-days: 30

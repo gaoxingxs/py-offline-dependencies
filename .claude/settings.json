@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:pip.pypa.io)",
+      "mcp__plugin_context7_context7__resolve-library-id",
+      "WebFetch(domain:pip.readthedocs.io)",
+      "WebFetch(domain:cibuildwheel.pypa.io)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:cibuildwheel.readthedocs.io)",
+      "Bash(pip wheel *)",
+      "Bash(pip3 wheel *)",
+      "Bash(python -m pip wheel --help)",
+      "Bash(pip download *)",
+      "Bash(pip3 download *)",
+      "Bash(python -m pip download --help)",
+      "Bash(where python *)",
+      "Bash(where python3 *)",
+      "Bash(where pip *)",
+      "Bash(where pip3 *)",
+      "Bash(/c/Users/gaoguangxing/AppData/Local/Microsoft/WindowsApps/python.exe --version)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.blog)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:docs.github.com)"
+    ]
+  }
+}

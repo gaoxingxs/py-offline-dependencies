@@ -1,0 +1,261 @@
+name: 构建 Python Wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      requirements:
+        description: '依赖项列表（每行一个，或 requirements.txt 文件路径，如 ./requirements.txt）'
+        required: true
+        default: ''
+        type: string
+      architecture:
+        description: '目标架构'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - x86_64
+          - aarch64
+      python-version:
+        description: 'Python 版本（多版本用逗号分隔，如 3.9,3.10,3.11）'
+        required: false
+        default: '3.11'
+        type: string
+      manylinux-version:
+        description: 'manylinux 版本（影响 glibc 兼容性下限）'
+        required: false
+        default: 'manylinux2014'
+        type: choice
+        options:
+          - manylinux2014
+          - manylinux_2_17
+          - manylinux_2_28
+      build-mode:
+        description: '构建模式'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - download-only
+          - build-only
+      aarch64-strategy:
+        description: 'aarch64 构建策略（native=原生ARM runner速度快，qemu=模拟速度慢但无需ARM runner）'
+        required: false
+        default: 'native'
+        type: choice
+        options:
+          - native
+          - qemu
+      build-deps:
+        description: '额外系统构建依赖（apt 包，空格分隔，如 libpq-dev libssl-dev）'
+        required: false
+        default: ''
+        type: string
+      extra-index-url:
+        description: '额外 PyPI 索引 URL（如 https://pypi.tuna.tsinghua.edu.cn/simple）'
+        required: false
+        default: ''
+        type: string
+      build-timeout:
+        description: '单包构建超时时间（分钟）'
+        required: false
+        default: '30'
+        type: string
+
+jobs:
+  # ==========================================
+  # Job 1: x86_64 架构
+  # ==========================================
+  build-x86_64:
+    if: inputs.architecture == 'both' || inputs.architecture == 'x86_64'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备 requirements 文件
+        id: prep
+        run: |
+          REQ="${{ inputs.requirements }}"
+          if [[ "$REQ" =~ ^\./ || "$REQ" =~ ^/ ]]; then
+            echo "req_file=$REQ" >> "$GITHUB_OUTPUT"
+          else
+            echo "$REQ" > ./requirements-input.txt
+            echo "req_file=./requirements-input.txt" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '${{ inputs.python-version }}'
+
+      - name: 安装构建工具
+        run: pip install --upgrade pip setuptools wheel build
+
+      - name: 安装系统构建依赖
+        if: inputs.build-deps != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ inputs.build-deps }}
+
+      - name: 下载 x86_64 已有 wheel
+        if: inputs.build-mode != 'build-only'
+        run: |
+          chmod +x ./scripts/download_wheels.sh
+          bash ./scripts/download_wheels.sh \
+            --requirements-file "${{ steps.prep.outputs.req_file }}" \
+            --platform "${{ inputs.manylinux-version }}_x86_64" \
+            --python-versions "${{ inputs.python-version }}" \
+            --output-dir ./wheelhouse/x86_64 \
+            --extra-index-url "${{ inputs.extra-index-url }}"
+
+      - name: 构建 x86_64 缺失的 wheel
+        if: inputs.build-mode != 'download-only'
+        run: |
+          chmod +x ./scripts/build_wheels.sh
+          bash ./scripts/build_wheels.sh \
+            --requirements-file "${{ steps.prep.outputs.req_file }}" \
+            --output-dir ./wheelhouse/x86_64 \
+            --extra-index-url "${{ inputs.extra-index-url }}" \
+            --build-mode "${{ inputs.build-mode }}" \
+            --build-timeout "${{ inputs.build-timeout }}"
+
+      - name: 上传 x86_64 wheel 文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-x86_64
+          path: ./wheelhouse/x86_64/
+          retention-days: 30
+
+  # ==========================================
+  # Job 2: aarch64 架构
+  # ==========================================
+  build-aarch64:
+    if: inputs.architecture == 'both' || inputs.architecture == 'aarch64'
+    runs-on: ${{ inputs.aarch64-strategy == 'native' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备 requirements 文件
+        id: prep
+        run: |
+          REQ="${{ inputs.requirements }}"
+          if [[ "$REQ" =~ ^\./ || "$REQ" =~ ^/ ]]; then
+            echo "req_file=$REQ" >> "$GITHUB_OUTPUT"
+          else
+            echo "$REQ" > ./requirements-input.txt
+            echo "req_file=./requirements-input.txt" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '${{ inputs.python-version }}'
+
+      - name: 安装构建工具
+        run: pip install --upgrade pip setuptools wheel build
+
+      - name: 安装系统构建依赖
+        if: inputs.build-deps != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ inputs.build-deps }}
+
+      - name: 设置 QEMU
+        if: inputs.aarch64-strategy == 'qemu'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: 下载 aarch64 已有 wheel
+        if: inputs.build-mode != 'build-only'
+        run: |
+          chmod +x ./scripts/download_wheels.sh
+          bash ./scripts/download_wheels.sh \
+            --requirements-file "${{ steps.prep.outputs.req_file }}" \
+            --platform "${{ inputs.manylinux-version }}_aarch64" \
+            --python-versions "${{ inputs.python-version }}" \
+            --output-dir ./wheelhouse/aarch64 \
+            --extra-index-url "${{ inputs.extra-index-url }}"
+
+      - name: 构建 aarch64 缺失的 wheel（原生 ARM64）
+        if: inputs.aarch64-strategy == 'native' && inputs.build-mode != 'download-only'
+        run: |
+          chmod +x ./scripts/build_wheels.sh
+          bash ./scripts/build_wheels.sh \
+            --requirements-file "${{ steps.prep.outputs.req_file }}" \
+            --output-dir ./wheelhouse/aarch64 \
+            --extra-index-url "${{ inputs.extra-index-url }}" \
+            --build-mode "${{ inputs.build-mode }}" \
+            --build-timeout "${{ inputs.build-timeout }}"
+
+      - name: 构建 aarch64 缺失的 wheel（QEMU 模拟）
+        if: inputs.aarch64-strategy == 'qemu' && inputs.build-mode != 'download-only'
+        run: |
+          chmod +x ./scripts/build_wheels.sh
+          bash ./scripts/build_wheels.sh \
+            --requirements-file "${{ steps.prep.outputs.req_file }}" \
+            --output-dir ./wheelhouse/aarch64 \
+            --extra-index-url "${{ inputs.extra-index-url }}" \
+            --build-mode "${{ inputs.build-mode }}" \
+            --build-timeout "${{ inputs.build-timeout }}" \
+            --qemu
+
+      - name: 上传 aarch64 wheel 文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-aarch64
+          path: ./wheelhouse/aarch64/
+          retention-days: 30
+
+  # ==========================================
+  # Job 3: 汇总结果
+  # ==========================================
+  summary:
+    if: always()
+    needs: [build-x86_64, build-aarch64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载所有 wheel 文件
+        uses: actions/download-artifact@v4
+        with:
+          path: ./all-wheels
+        continue-on-error: true
+
+      - name: 生成汇总报告
+        run: |
+          echo "## Python Wheels 构建结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "构建参数: Python ${{ inputs.python-version }}, ${{ inputs.manylinux-version }}, 模式=${{ inputs.build-mode }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          for ARCH in x86_64 aarch64; do
+            DIR="./all-wheels/wheels-${ARCH}"
+            if [[ -d "$DIR" ]]; then
+              WHL_COUNT=$(find "$DIR" -name "*.whl" | wc -l)
+              echo "### ${ARCH} 架构 — ${WHL_COUNT} 个 wheel" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+
+              find "$DIR" -name "*.whl" -printf "%f\n" | sort | while read -r f; do
+                echo "- \`${f}\`" >> "$GITHUB_STEP_SUMMARY"
+              done
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+
+              if [[ -f "$DIR/.failed_packages.txt" ]]; then
+                FAILED=$(grep -v '^$' "$DIR/.failed_packages.txt" 2>/dev/null || true)
+                if [[ -n "$FAILED" ]]; then
+                  echo "#### 构建失败" >> "$GITHUB_STEP_SUMMARY"
+                  echo '```' >> "$GITHUB_STEP_SUMMARY"
+                  echo "$FAILED" >> "$GITHUB_STEP_SUMMARY"
+                  echo '```' >> "$GITHUB_STEP_SUMMARY"
+                  echo "" >> "$GITHUB_STEP_SUMMARY"
+                fi
+              fi
+            fi
+          done
+
+      - name: 合并所有 wheel 到单一 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-python-wheels
+          path: ./all-wheels/
+          retention-days: 30
